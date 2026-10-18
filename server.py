@@ -1,5 +1,8 @@
+import datetime
+import hashlib
 import json
 import os
+import threading
 
 from flask import Flask, jsonify, request, send_from_directory
 from web3 import Web3
@@ -11,6 +14,30 @@ import wallet
 app = Flask(__name__, static_folder="static")
 PENDING = {}
 COUNTER = [0]
+PAUSED = [False]
+SEND_LOCK = threading.Lock()
+LOG_LOCK = threading.Lock()
+
+
+def _canon(e):
+    return json.dumps({k: v for k, v in e.items() if k != "hash"}, sort_keys=True)
+
+
+def chained_log(entry):
+    """Append-only log where every entry carries the hash of the one before it."""
+    with LOG_LOCK:
+        prev = "genesis"
+        for r in read_log():
+            if "hash" in r:
+                prev = r["hash"]
+        entry["time"] = datetime.datetime.utcnow().isoformat()
+        entry["prev"] = prev
+        entry["hash"] = hashlib.sha256((prev + _canon(entry)).encode()).hexdigest()
+        with open("audit_log.jsonl", "a") as f:
+            f.write(json.dumps(entry) + "\n")
+
+
+agent.log = chained_log
 
 
 def read_log():
@@ -27,6 +54,7 @@ def checks(to, amount, bal):
     ok_addr = bool(to) and Web3.is_address(to)
     amt = amount if amount is not None else 0
     return [
+        {"label": "Payments are not paused (kill switch)", "ok": not PAUSED[0], "hard": True},
         {"label": "Recipient address is valid", "ok": bool(ok_addr), "hard": True},
         {"label": "Amount is greater than zero", "ok": amount is not None and amount > 0, "hard": True},
         {"label": f"Within the {policy.MAX_PER_TX} ETH transaction limit", "ok": amt <= policy.MAX_PER_TX, "hard": True},
@@ -63,7 +91,7 @@ def state():
         address=wallet.acct.address, balance=bal, block=block,
         spent=policy.spent_today(), daily=policy.DAILY_LIMIT, per_tx=policy.MAX_PER_TX,
         confirm_above=policy.CONFIRM_ABOVE, contacts=policy.load_contacts(),
-        log=list(reversed(read_log()))[:60],
+        log=list(reversed(read_log()))[:60], paused=PAUSED[0],
     )
 
 
@@ -86,6 +114,8 @@ def command():
         amount = None
     bal = wallet.get_balance()
     tier, reason = policy.evaluate(to, amount, bal)
+    if PAUSED[0]:
+        tier, reason = "BLOCK", "Payments are paused by the kill switch"
     base = {"action": "send", "to": to, "amount": amount or 0, "tier": tier, "reason": reason}
     out = {"kind": "send", "to": to, "amount": amount, "tier": tier, "reason": reason,
            "checks": checks(to, amount, bal)}
@@ -95,22 +125,55 @@ def command():
     elif tier == "AUTO":
         out.update(send(base, to, amount))
     else:
+        PENDING.clear()
         COUNTER[0] += 1
         PENDING[COUNTER[0]] = {"base": base, "to": to, "amount": amount}
         out.update(status="pending", id=COUNTER[0])
     return jsonify(out)
 
 
-@app.post("/api/approve")
-def approve():
+def _approve():
     p = PENDING.pop((request.json or {}).get("id"), None)
     if not p:
         return jsonify(status="failed", message="That request is no longer pending.")
     tier, reason = policy.evaluate(p["to"], p["amount"], wallet.get_balance())
+    if PAUSED[0]:
+        tier, reason = "BLOCK", "Payments are paused by the kill switch"
     if tier == "BLOCK":
         agent.log({**p["base"], "tier": "BLOCK", "reason": reason, "status": "blocked"})
         return jsonify(status="blocked", reason=reason)
     return jsonify(send(p["base"], p["to"], p["amount"]))
+
+
+@app.post("/api/approve")
+def approve():
+    if not SEND_LOCK.acquire(blocking=False):
+        return jsonify(status="failed", message="Another payment is already in progress.")
+    try:
+        return _approve()
+    finally:
+        SEND_LOCK.release()
+
+
+@app.post("/api/pause")
+def pause():
+    PAUSED[0] = bool((request.json or {}).get("paused"))
+    agent.log({"action": "kill-switch", "status": "paused" if PAUSED[0] else "resumed", "amount": 0, "to": ""})
+    return jsonify(paused=PAUSED[0])
+
+
+@app.get("/api/verify")
+def verify():
+    prev, n, legacy = "genesis", 0, 0
+    for i, r in enumerate(read_log()):
+        if "hash" not in r:
+            legacy += 1
+            continue
+        if r.get("prev") != prev or hashlib.sha256((prev + _canon(r)).encode()).hexdigest() != r["hash"]:
+            return jsonify(ok=False, checked=n, legacy=legacy, message=f"Entry {i + 1} was altered or removed.")
+        prev, n = r["hash"], n + 1
+    return jsonify(ok=True, checked=n, legacy=legacy,
+                   message=f"Ledger intact. {n} chained entries verified" + (f", {legacy} older entries unprotected." if legacy else "."))
 
 
 @app.post("/api/decline")
@@ -189,6 +252,8 @@ def prepare():
     except (TypeError, ValueError):
         amount = None
     tier, reason = policy.evaluate(to, amount, bal)
+    if PAUSED[0]:
+        tier, reason = "BLOCK", "Payments are paused by the kill switch"
     base = {"action": "send", "to": to, "amount": amount or 0, "tier": tier, "reason": reason,
             "chain": key, "wallet": "user"}
     out = {"kind": "send", "to": to, "amount": amount, "tier": tier, "reason": reason,

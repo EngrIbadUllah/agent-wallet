@@ -117,6 +117,7 @@ td a{color:var(--ok)}
   <div class="brand">Agent <i>Wallet</i></div>
   <div class="net"><span><span class="dot"></span><b>Sepolia testnet</b></span><span>Block <b id="blk">–</b></span><span>No real funds at risk</span></div>
   <div class="wbar"><span class="mode" id="modebadge">Demo agent wallet</span>
+    <button id="kill">Pause payments</button>
     <select id="chain" aria-label="Network"></select>
     <button class="solid" id="conn">Connect wallet</button></div>
 </div></header>
@@ -177,7 +178,7 @@ td a{color:var(--ok)}
 <section class="wide">
   <div class="bar">
     <div><h2 style="margin:0">Ledger</h2><p>Every decision, including the ones that moved no money.</p></div>
-    <button class="btn alt" id="rt" style="flex:none;padding:9px 18px">Run six attack tests</button>
+    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap"><span class="lbl" id="vres"></span><button class="btn alt" id="vf" style="flex:none;padding:9px 18px">Verify ledger</button><button class="btn alt" id="rt" style="flex:none;padding:9px 18px">Run six attack tests</button></div>
   </div>
   <div class="tbl" id="rtbox" style="display:none;margin-bottom:18px"></div>
   <div class="tbl"><table><thead><tr><th>Time (UTC)</th><th>Outcome</th><th>Amount</th><th>Recipient</th><th>Reason</th><th>Proof</th></tr></thead><tbody id="rows"></tbody></table></div>
@@ -210,7 +211,7 @@ async function loadTokens(){
   }catch(e){box.textContent='Could not load tokens.'}
 }
 async function load(){
-  S=await api('/api/state');loadTokens();
+  S=await api('/api/state');loadTokens();$('#kill').textContent=S.paused?'Resume payments':'Pause payments';
   if(mode==='agent')$('#bal').textContent=S.balance.toFixed(4);
   $('#blk').textContent=S.block??'–';
   if(mode==='agent')$('#addr').textContent=S.address;
@@ -241,7 +242,7 @@ function slip(res){
   if(res.status==='pending'){pend=res.id;$('#ok').onclick=()=>decide('approve');$('#no').onclick=()=>decide('decline')}
 }
 async function decide(kind){
-  const id=pend;pend=null;const r=await api('/api/'+kind,{id});
+  const id=pend;pend=null;$('#slip .act')?.remove();const r=await api('/api/'+kind,{id});
   $('#slip .act')?.remove();
   if(r.status==='sent')entry('Wallet',`<div class="say">Sent. ${txLink(r.tx)}</div>${stamp('sent')}`);
   else if(r.status==='declined')entry('Wallet',`<div class="say">Cancelled. No funds moved.</div>${stamp('declined')}`);
@@ -266,6 +267,8 @@ async function run(text){
   entry('Wallet',`<div class="say">${say}</div>${stamp(r.status)}`);
   load();
 }
+$('#kill').onclick=async()=>{await api('/api/pause',{paused:!S.paused});load()};
+$('#vf').onclick=async()=>{const r=await api('/api/verify');$('#vres').textContent=(r.ok?'✓ ':'✗ ')+r.message};
 $('#form').onsubmit=e=>{e.preventDefault();const v=$('#cmd').value;$('#cmd').value='';run(v)};
 document.querySelectorAll('.chip').forEach(b=>b.onclick=()=>run(b.dataset.c));
 $('#addr').onclick=()=>navigator.clipboard?.writeText(S.address);
